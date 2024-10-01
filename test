@@ -1,0 +1,78 @@
+trigger:
+  - master
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+
+steps:
+- script: |
+    mkdir $(Build.artifactstagingdirectory)\db
+  displayName: 'Create DB directory'
+
+- script: |
+    mkdir $(Build.artifactstagingdirectory)\sql
+  displayName: 'Create sql directory'
+
+- task: NuGetToolInstaller@1
+
+- task: NuGetCommand@2
+  inputs:
+    restoreSolution: '$(solution)'
+
+- task: VSBuild@1
+  inputs:
+    solution: '$(solution)'
+    msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:PackageLocation="$(Build.ArtifactStagingDirectory)"'
+    platform: '$(buildPlatform)'
+    configuration: '$(buildConfiguration)'
+
+- task: PublishPipelineArtifact@1
+  inputs:
+    targetPath: '$(Build.artifactstagingdirectory)'
+    artifact: 'drop'
+    
+# Step to execute EF Core migrations
+- task: PublishBuildArtifacts@1
+  displayName: Publish DB artifact
+  inputs: 
+   PathtoPublish: '$(Build.artifactstagingdirectory)/db'
+   ArtifactName: 'db'
+   publishLocation: 'container'
+
+- task: DotNetCoreCLI@2
+  displayName: Install EF CLI
+  inputs:
+    command: 'custom'
+    custom: 'tool'
+    arguments: 'install --global dotnet-ef'
+
+- task: DotNetCoreCLI@2
+  displayName: Genarate SQL script for baseline'
+  continueOnError: true
+  inputs:
+    command: 'custom'
+    custom: 'ef'
+    arguments: migrations script --output $(Build.artifactstagingdirectory)/sql/script.sql --idempotent --project $(Build.SourcesDirectory)/BlazorPipline.csproj --context AppDbContext
+
+# トランザクション管理を付与するスクリプトを追加
+- script: |
+    # PowerShellを使用して GO ステートメントを削除
+    (Get-Content $(Build.artifactstagingdirectory)/sql/script.sql) -replace 'GO', '' | Set-Content $(Build.artifactstagingdirectory)/sql/script.sql
+
+    # トランザクションをスクリプトの最初と最後に追加
+    echo BEGIN TRANSACTION; | cat - $(Build.artifactstagingdirectory)/sql/script.sql > $(Build.artifactstagingdirectory)/sql/temp.sql
+    mv $(Build.artifactstagingdirectory)/sql/temp.sql $(Build.artifactstagingdirectory)/sql/script.sql
+    echo COMMIT TRANSACTION; >> $(Build.artifactstagingdirectory)/sql/script.sql
+  displayName: 'Add transaction management and remove GO statements from SQL script'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish SQL Artifact'
+  inputs:
+    PathtoPublish: '$(Build.artifactstagingdirectory)/sql'
+    ArtifactName: 'sql'
+    publishLocation: 'container'
